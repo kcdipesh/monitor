@@ -1,0 +1,12 @@
+[
+  {
+    "name": "input 1",
+    "x": 0,
+    "y": 0,
+    "width": 1,
+    "height": 1,
+    "source": "rtmp://95.213.197.210/live/live",
+    "video_width": 600,
+    "video_height": 0
+  }
+]
