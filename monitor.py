@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import math
 
 from config import AppConfiguration
 
@@ -22,7 +23,6 @@ class FrameInputException(Exception):
 
 
 class Application:
-
     def __init__(self, conf, parsed_args):
         self.conf = conf
         self.verbosity = parsed_args.verbosity
@@ -77,14 +77,148 @@ class Application:
             self._layout_check()
         except LayoutException as e:
             self._error(str(e))
-        self.layout_source_info = list(map(self._get_source_info, [f['source'] for f in self.layout]))
+        for (i, ls) in enumerate(map(self._get_source_info, [f['source'] for f in self.layout])):
+            audio_streams = []
+            video_streams = []
+            for s in ls['streams']:
+                if s['codec_type'] == 'video':
+                    self._info('Source {} - found video stream #{}.'.format(i, s['index']))
+                    video_streams.append(s)
+                elif s['codec_type'] == 'audio':
+                    self._info('Source {} - found audio stream #{}.'.format(i, s['index']))
+                    audio_streams.append(s)
+            video_height = self.layout[i]['video_height']
+            graph, meter_ratio = self._get_meter_graph(audio_streams, self.layout[i]['meter_channel_font'],
+                                                       self.layout[i]['meter_channel_font_size'])
+            self._info('Scaling source video...')
+            vs = video_streams[0]
+            try:
+                l, r = str(vs['sample_aspect_ratio']).split(':')
+            except ValueError:
+                self._warning('SAR error - using SAR = 1.')
+                sar = 1
+            else:
+                sar = float(l) / float(r)
+                self._info('Source SAR = {}.'.format(sar))
+            eff_source_video_width = math.trunc(vs['width'] * sar)
+            source_video_height = vs['height']
+            scale_factor = video_height / source_video_height
+            self._info('Scale factor: {}.'.format(scale_factor))
+            video_width = math.trunc(eff_source_video_width * scale_factor)
+            self._info('Scaled video size: {w}x{h}.'.format(w=video_width, h=video_height))
+            scale_chain = "[v:0]scale={w}:{h},setsar=sar=1[scaled_video]".format(w=video_width, h=video_height)
+            graph.append(scale_chain)
+            self._info('Drawing border...')
+            border_width = 2
+            border_color = '0x00FF00'
+            border_chain = "color=c={border_color}:s={w}x{h}[border_bg];" \
+                           "[border_bg][scaled_video]overlay={bw}:{bw}[bordered_video]" \
+                           "".format(border_color=border_color, w=border_width * 2 + video_width,
+                                     h=border_width * 2 + video_height, bw=border_width)
+            self._info('Border chains: "{}".'.format(border_chain))
+            graph.append(border_chain)
+            self._info('Scale chain: "{}".'.format(scale_chain))
+            self._info('Calculating audio meter size...')
+            self._info('Audio meter ratio: {}.'.format(meter_ratio))
+            meter_width = math.trunc(video_height * meter_ratio)
+            meter_height = border_width * 2 + video_height
+            self._info('Scaled audio meter size: {w}x{h}.'.format(w=meter_width, h=video_height))
+            meter_scale_chain = "[all_meters_out]scale=w={w}:h={h}[scaled_meters]".format(w=meter_width, h=meter_height)
+            self._info('Audio meter scale chain: "{}".'.format(meter_scale_chain))
+            graph.append(meter_scale_chain)
+            total_width = border_width * 2 + video_width + 2 + meter_width
+            total_height = meter_height
+            chain = "color=c=black:s={bg_width}x{bg_height}[main_bg];" \
+                    "[main_bg][scaled_meters]overlay={meters_x_offset}:0[main_mid_0];" \
+                    "[main_mid_0][bordered_video]overlay=0:0[video_out]" \
+                    "".format(bg_width=total_width, bg_height=total_height,
+                              meters_x_offset=border_width * 2 + video_width + 2)
+            self._info('Overlay chains: "{}".'.format(chain))
+            graph.append(chain)
+            graph_str = ';'.join(graph)
+            self._info('Filtergraph ready: "{}".'.format(graph_str))
+
+    def _get_meter_graph(self, audio_streams, channel_label_font, channel_label_font_size):
+        self._info('Building audio meter graph...')
+        graph = []
+        # scale
+        scale_width = 24
+        scale_height = 456
+        scale_x = 8
+        scale_y = 22
+        self._info('Drawing scale...')
+        scale_graph = "anullsrc, ebur128=video=1:meter=18[ebur_nullsrc],anullsink;" \
+                     "[ebur_nullsrc]crop={w}:{h}:{x}:{y}[ebur_scale]" \
+                     "".format(w=scale_width, h=scale_height, x=scale_x, y=scale_y)
+        self._info('Scale chains: "{}".'.format(scale_graph))
+        graph.append(scale_graph)
+        audio_in_chains = []
+        audio_splitted_channels = []
+        self._info('Splitting audio channels...')
+        for s in audio_streams:
+            if s['channels'] == 1:
+                audio_in_chains.append("[0:{s_id}]anull[{output_name}]".format(
+                    s_id=s['index'], output_name="audio_in_{}_0".format(s['index'])
+                ))
+                audio_splitted_channels.append("{}_0".format(s['index']))
+            else:
+                splitted_outputs = ["{}_{}".format(s['index'], ch_id) for ch_id in range(0, s['channels'])]
+                chain = "[0:{s_id}]channelsplit=channel_layout={ch_layout}{outputs}".format(
+                    s_id=s['index'], ch_layout=s['channel_layout'],
+                    outputs=''.join(["[audio_in_{}]".format(o) for o in splitted_outputs])
+                )
+                audio_in_chains.append(chain)
+                audio_splitted_channels.extend(splitted_outputs)
+        self._info('Audio inputs chains: "{}".'.format(';'.join(audio_in_chains)))
+        graph.extend(audio_in_chains)
+        audio_meter_chains = []
+        meter_width = 22
+        meter_crop_width = 20
+        meter_crop_height = 432
+        meter_x = 612
+        meter_y = 40
+        meter_y_offset = 18
+        meter_label_y_offset = 4
+        self._info('Drawing audio meters...')
+        for c in audio_splitted_channels:
+            chain = "color=c=black:s={meter_width}x{scale_height}[meter_bg_{ch}];" \
+                    "[audio_in_{ch}]ebur128=meter=18:video=1[ebur_{ch}], anullsink;" \
+                    "[ebur_{ch}]crop={meter_crop_width}:{meter_crop_height}:{meter_x}:{meter_y}[ebur_crop_{ch}];" \
+                    "[meter_bg_{ch}][ebur_crop_{ch}]overlay=0:{meter_y_offset}," \
+                    "drawtext=fontcolor=0xF0F0F0:fontfile='{font}':fontsize={fontsize}:text='{text}':" \
+                    "x=0:y={meter_label_y_offset}[meter_{ch}]" \
+                    "".format(ch=c, font=channel_label_font, fontsize=channel_label_font_size,
+                              text=c.replace('_', r'\:'), meter_width=meter_width, scale_height=scale_height,
+                              meter_crop_width=meter_crop_width, meter_crop_height=meter_crop_height, meter_x=meter_x,
+                              meter_y=meter_y, meter_y_offset=meter_y_offset, meter_label_y_offset=meter_label_y_offset)
+            audio_meter_chains.append(chain)
+        self._info('Audio meters chains: "{}".'.format(';'.join(audio_meter_chains)))
+        graph.extend(audio_meter_chains)
+        total_meters_width = scale_width + 2 + len(audio_meter_chains) * meter_width
+        meters_ratio = total_meters_width / scale_height
+        self._info('Combining audio meters...')
+        bg_chain = "color=c=black:s={total_meters_width}x{scale_height}[all_meters_bg];" \
+                   "[all_meters_bg][ebur_scale]overlay=0:0[all_meters_mid_0]" \
+                   "".format(total_meters_width=total_meters_width, scale_height=scale_height)
+        self._info('Audio meters background chains: "{}".'.format(bg_chain))
+        overlay_chains = [bg_chain]
+        total_meters = len(audio_splitted_channels)
+        for i, c in enumerate(audio_splitted_channels):
+            chain = "[all_meters_mid_{i}][meter_{ch}]overlay={x}:0[{out}]" \
+                    "".format(i=i, ch=c, x=scale_width + 2 + i * meter_width,
+                              out='all_meters_mid_{next_i}'.format(next_i=i + 1)
+                              if (i + 1) < total_meters else 'all_meters_out')
+            overlay_chains.append(chain)
+        self._info('Overlaid meters chains: "{}".'.format(';'.join(overlay_chains)))
+        graph.extend(overlay_chains)
+        return graph, meters_ratio
 
     def _conf_check(self):
         self._info('Checking configuration...')
         # check required parameters
         required_parameters = {
             'BASE_DIR': str, 'FFMPEG_PATH': str, 'FFMPEG_GLOBAL_ARGS': list, 'FFPROBE_PATH': str, 'FFPROBE_ARGS': list,
-            'FFPROBE_TIMEOUT': int, 'AUDIO_METER_CHANNELS': int, 'STATIC_DIR': str, 'LAYOUT_MAP_WIDTH': int
+            'FFPROBE_TIMEOUT': int, 'STATIC_DIR': str, 'LAYOUT_MAP_WIDTH': int
         }
         for (p, t) in required_parameters.items():
             try:
@@ -167,7 +301,8 @@ class Application:
             ))
         self._info('Checking frames descriptions...')
         required_frame_parameters = {'name', 'x', 'y', 'width', 'height', 'source'}
-        frame_parameters_types = {'name': str, 'x': int, 'y': int, 'width': int, 'height': int, 'source': str}
+        frame_parameters_types = {'name': str, 'x': int, 'y': int, 'width': int, 'height': int, 'source': str,
+                                  'video_height': int, 'meter_channel_font': str, 'meter_channel_font_size': int}
         map_height = 0
         for (i, f) in enumerate(layout):
             if type(f) != dict:
@@ -185,6 +320,8 @@ class Application:
             if (f['x'] + f['width']) > self.conf.LAYOUT_MAP_WIDTH:
                 raise LayoutException('Frame\'s width exceeds layout map width (frame {})'.format(i))
             map_height = max(map_height, f['y'] + f['height'])
+            if f['video_height'] <= 0:
+                raise LayoutException('Video height must be a positive integer.')
         layout_map = [['.' for y in range(0, map_height)] for x in range(0, self.conf.LAYOUT_MAP_WIDTH)]
         for (i, f) in enumerate(layout):
             occupied_by_frame = [(x, y) for x in range(f['x'], f['x'] + f['width'])
@@ -208,16 +345,7 @@ class Application:
             )
         except subprocess.TimeoutExpired:
             raise FrameInputException('Failed to fetch info from "{}" - timeout expired.'.format(input_path))
-        streams = json.loads(o)['streams']
-        audio_streams = []
-        video_streams = []
-        for s in streams:
-            if s['codec_type'] == 'video':
-                self._info('Found video stream #{}.'.format(s['index']))
-                video_streams.append(s)
-            elif s['codec_type'] == 'audio':
-                self._info('Found audio stream #{}.'.format(s['index']))
-                audio_streams.append(s)
+        return {'streams': json.loads(o)['streams']}
 
 
 if __name__ == '__main__':

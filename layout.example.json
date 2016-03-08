@@ -6,7 +6,8 @@
     "width": 1,
     "height": 1,
     "source": "rtmp://95.213.197.210/live/live",
-    "video_width": 600,
-    "video_height": 0
+    "video_height": 600,
+    "meter_channel_font": "C:\\\\Windows\\\\Fonts\\\\verdana.ttf",
+    "meter_channel_font_size": 10
   }
 ]
