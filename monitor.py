@@ -4,10 +4,15 @@ import os
 import subprocess
 import sys
 import math
+import threading
+import datetime
+import re
+from collections import deque
 
 from config import AppConfiguration
 
 VERSION = "dev"
+EBUR_RE = re.compile(r'\[Parsed_ebur128_.+M:\s*(?P<m>\S+)\s+S:\s*(?P<s>\S+)\s+I:\s*(?P<i>\S+).+LRA:\s*(?P<lra>\S+)')
 
 
 class ConfException(Exception):
@@ -20,6 +25,56 @@ class LayoutException(Exception):
 
 class FrameInputException(Exception):
     pass
+
+
+def _ffmpeg_thread(exec_args, log_path, ebur_stats_path, audio_ch_ids):
+
+        deque_size = 5
+
+        def _write_log(s):
+            with open(log_path, 'a') as fout:
+                fout.write("{}: {}\n".format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), s))
+
+        def _write_ebur_stats(stats):
+            with open(ebur_stats_path, 'w') as fout:
+                for s in stats:
+                    fout.write('{}\n'.format(s))
+
+        while True:
+            _write_log('Starting ffmpeg process {}'.format(' '.join(exec_args)))
+            last_lines_log = deque(maxlen=deque_size)
+            ebur_stats_disabled = False
+            proc = subprocess.Popen(exec_args, stderr=subprocess.PIPE, universal_newlines=True)
+            _write_log('ffmpeg process started')
+            audio_ch_count = len(audio_ch_ids)
+            gathered_ebur_stats = []
+            current_ch = 0
+            passed_summary = False
+            for line in proc.stderr:
+                last_lines_log.append(line)
+                if not ebur_stats_disabled:
+                    if line.startswith('[Parsed_ebur128_'):
+                        if not passed_summary and line.find('Summary') != -1:
+                            continue
+                        m = EBUR_RE.match(line)
+                        if m is not None:
+                            passed_summary = True
+                            gathered_ebur_stats.append('{} {}'.format(audio_ch_ids[current_ch], ' '.join(m.groups())))
+                            current_ch += 1
+                        else:
+                            try:
+                                os.remove(ebur_stats_path)
+                            except FileNotFoundError:
+                                pass
+                            _write_log('<WARNING> EBUR stats parsing error - disabling.')
+                            ebur_stats_disabled = True
+                        if current_ch == audio_ch_count:
+                            _write_ebur_stats(gathered_ebur_stats)
+                            gathered_ebur_stats = []
+                            current_ch = 0
+            _write_log(
+                'ffmpeg process stopped (code {}). Output:\n"{}".'.format(proc.returncode, '\n'.join(last_lines_log))
+            )
 
 
 class Application:
@@ -77,6 +132,7 @@ class Application:
             self._layout_check()
         except LayoutException as e:
             self._error(str(e))
+        ffmpeg_threads = []
         for (i, ls) in enumerate(map(self._get_source_info, [f['source'] for f in self.layout])):
             audio_streams = []
             video_streams = []
@@ -88,8 +144,9 @@ class Application:
                     self._info('Source {} - found audio stream #{}.'.format(i, s['index']))
                     audio_streams.append(s)
             video_height = self.layout[i]['video_height']
-            graph, meter_ratio = self._get_meter_graph(audio_streams, self.layout[i]['meter_channel_font'],
-                                                       self.layout[i]['meter_channel_font_size'])
+            graph, meter_ratio, audio_channel_ids = self._get_meter_graph(
+                audio_streams, self.layout[i]['meter_channel_font'], self.layout[i]['meter_channel_font_size']
+            )
             self._info('Scaling source video...')
             vs = video_streams[0]
             try:
@@ -137,6 +194,22 @@ class Application:
             graph.append(chain)
             graph_str = ';'.join(graph)
             self._info('Filtergraph ready: "{}".'.format(graph_str))
+            exec_args = [self.conf.FFMPEG_PATH] + self.conf.FFMPEG_GLOBAL_ARGS + ['-i', self.layout[i]['source']] + \
+                        ['-filter_complex', graph_str, '-map', 'a:0', '-map', '[video_out]'] + \
+                        self.conf.FFMPEG_OUT_ARGS + [self.conf.FFMPEG_OUT_STR_BUILDER(i)]
+            self._info('Args: {}'.format(exec_args))
+            log_path = os.path.join(self.conf.LOG_DIR, 'monitor.source{}.log'.format(i))
+            self._info('Creating thread #{}...'.format(i))
+            ebur_stats_path = self.conf.EBUR_STATS_FILENAME_TPL.format(i)
+            thread = threading.Thread(
+                target=_ffmpeg_thread,
+                args=(exec_args, log_path, ebur_stats_path, audio_channel_ids )
+            )
+            ffmpeg_threads.append(thread)
+        self._info('Starting ffmpeg threads...')
+        for i, t in enumerate(ffmpeg_threads):
+            t.start()
+            self._info('ffmpeg thread #{} started.'.format(i))
 
     def _get_meter_graph(self, audio_streams, channel_label_font, channel_label_font_size):
         self._info('Building audio meter graph...')
@@ -148,8 +221,8 @@ class Application:
         scale_y = 22
         self._info('Drawing scale...')
         scale_graph = "anullsrc, ebur128=video=1:meter=18[ebur_nullsrc],anullsink;" \
-                     "[ebur_nullsrc]crop={w}:{h}:{x}:{y}[ebur_scale]" \
-                     "".format(w=scale_width, h=scale_height, x=scale_x, y=scale_y)
+                      "[ebur_nullsrc]crop={w}:{h}:{x}:{y}[ebur_scale]" \
+                      "".format(w=scale_width, h=scale_height, x=scale_x, y=scale_y)
         self._info('Scale chains: "{}".'.format(scale_graph))
         graph.append(scale_graph)
         audio_in_chains = []
@@ -182,12 +255,12 @@ class Application:
         self._info('Drawing audio meters...')
         for c in audio_splitted_channels:
             chain = "color=c=black:s={meter_width}x{scale_height}[meter_bg_{ch}];" \
-                    "[audio_in_{ch}]ebur128=meter=18:video=1[ebur_{ch}], anullsink;" \
+                    "[audio_in_{ch}]ebur128=meter=18:video=1:framelog=info[ebur_{ch}], anullsink;" \
                     "[ebur_{ch}]crop={meter_crop_width}:{meter_crop_height}:{meter_x}:{meter_y}[ebur_crop_{ch}];" \
                     "[meter_bg_{ch}][ebur_crop_{ch}]overlay=0:{meter_y_offset}," \
                     "drawtext=fontcolor=0xF0F0F0:fontfile='{font}':fontsize={fontsize}:text='{text}':" \
                     "x=0:y={meter_label_y_offset}[meter_{ch}]" \
-                    "".format(ch=c, font=channel_label_font, fontsize=channel_label_font_size,
+                    "".format(ch=c, font=self._escape_str(channel_label_font), fontsize=channel_label_font_size,
                               text=c.replace('_', r'\:'), meter_width=meter_width, scale_height=scale_height,
                               meter_crop_width=meter_crop_width, meter_crop_height=meter_crop_height, meter_x=meter_x,
                               meter_y=meter_y, meter_y_offset=meter_y_offset, meter_label_y_offset=meter_label_y_offset)
@@ -211,26 +284,32 @@ class Application:
             overlay_chains.append(chain)
         self._info('Overlaid meters chains: "{}".'.format(';'.join(overlay_chains)))
         graph.extend(overlay_chains)
-        return graph, meters_ratio
+        return graph, meters_ratio, list(map(lambda x: x.replace('_', ':'), audio_splitted_channels))
+
+    @staticmethod
+    def _escape_str(s):
+        return s.replace('\\', '\\\\').replace(':', '\\:')
 
     def _conf_check(self):
         self._info('Checking configuration...')
         # check required parameters
         required_parameters = {
             'BASE_DIR': str, 'FFMPEG_PATH': str, 'FFMPEG_GLOBAL_ARGS': list, 'FFPROBE_PATH': str, 'FFPROBE_ARGS': list,
-            'FFPROBE_TIMEOUT': int, 'STATIC_DIR': str, 'LAYOUT_MAP_WIDTH': int
+            'FFPROBE_TIMEOUT': int, 'STATIC_DIR': str, 'LAYOUT_MAP_WIDTH': int, 'FFMPEG_OUT_ARGS': list,
+            'FFMPEG_OUT_STR_BUILDER': None, 'EBUR_STATS_FILENAME_TPL': str
         }
         for (p, t) in required_parameters.items():
             try:
                 param_value = getattr(self.conf, p)
             except AttributeError:
                 raise ConfException('Required parameter is missing: "{}".'.format(p))
-            if type(param_value) != t:
+            if t is not None and type(param_value) != t:
                 raise ConfException('Parameter "{}" must be a {} - {} given.'.format(p, t, type(param_value)))
         # checking dir existence
         self._check_dir_existence({
             'BASE_DIR': self.conf.BASE_DIR,
             'STATIC_DIR': self.conf.STATIC_DIR,
+            'LOG_DIR': self.conf.LOG_DIR,
         })
         # checking file existence
         self._check_file_existence({
@@ -249,6 +328,14 @@ class Application:
                 'FFPROBE_PATH ("{}") is not a ffprobe executable.'.format(self.conf.FFPROBE_PATH)
             )
         })
+        # checking log directory
+        tmp_file_path = os.path.join(self.conf.LOG_DIR, 'monitor.tmp')
+        try:
+            open(tmp_file_path, 'w')
+        except OSError as e:
+            raise ConfException('Log directory check failed: {}.'.format(str(e)))
+        else:
+            os.remove(tmp_file_path)
 
     @staticmethod
     def _check_file_existence(file_dict):
