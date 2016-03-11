@@ -209,7 +209,7 @@ class Application:
         self._info('Starting ffmpeg threads...')
         for i, t in enumerate(ffmpeg_threads):
             t.start()
-            self._info('ffmpeg thread #{} started.'.format(i))
+            self._log('ffmpeg thread #{} started.'.format(i))
 
     def _get_meter_graph(self, audio_streams, channel_label_font, channel_label_font_size):
         self._info('Building audio meter graph...')
