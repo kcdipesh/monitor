@@ -5,8 +5,8 @@
     "y": 0,
     "width": 1,
     "height": 1,
-    "source": "udp://239.255.0.1:10000",
-    "video_height": 400,
+    "source": "rtmp://95.213.197.210/live/live",
+    "video_height": 200,
     "meter_channel_font": "C:\\Windows\\Fonts\\verdana.ttf",
     "meter_channel_font_size": 10
   },
@@ -16,8 +16,8 @@
     "y": 0,
     "width": 1,
     "height": 1,
-    "source": "udp://239.255.0.2:10000",
-    "video_height": 400,
+    "source": "rtmp://95.213.197.210/live/live",
+    "video_height": 200,
     "meter_channel_font": "C:\\Windows\\Fonts\\verdana.ttf",
     "meter_channel_font_size": 10
   }

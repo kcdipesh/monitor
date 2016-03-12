@@ -72,6 +72,7 @@ def _ffmpeg_thread(exec_args, log_path, ebur_stats_path, audio_ch_ids):
                             _write_ebur_stats(gathered_ebur_stats)
                             gathered_ebur_stats = []
                             current_ch = 0
+            proc.wait()
             _write_log(
                 'ffmpeg process stopped (code {}). Output:\n"{}".'.format(proc.returncode, '\n'.join(last_lines_log))
             )
@@ -296,7 +297,7 @@ class Application:
         required_parameters = {
             'BASE_DIR': str, 'FFMPEG_PATH': str, 'FFMPEG_GLOBAL_ARGS': list, 'FFPROBE_PATH': str, 'FFPROBE_ARGS': list,
             'FFPROBE_TIMEOUT': int, 'STATIC_DIR': str, 'LAYOUT_MAP_WIDTH': int, 'FFMPEG_OUT_ARGS': list,
-            'FFMPEG_OUT_STR_BUILDER': None, 'EBUR_STATS_FILENAME_TPL': str
+            'FFMPEG_OUT_STR_BUILDER': None, 'EBUR_STATS_FILENAME_TPL': str, 'LOG_DIR': str
         }
         for (p, t) in required_parameters.items():
             try:
